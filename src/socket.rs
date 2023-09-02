@@ -9,11 +9,80 @@ use std::{collections::HashMap, sync::Mutex};
 use uuid::Uuid;
 
 // let mut rooms = vec
+static SERVER: Server = Server {
+    rooms: Vec::new(),
+    addr: None,
+};
 
 static ROOMS: Lazy<Mutex<Vec<Room>>> = Lazy::new(|| {
     let map: Vec<Room> = Vec::new();
     return Mutex::new(map);
 });
+
+#[derive(Message)]
+#[rtype(result = "()")]
+
+enum ServerCommands {
+    AddRoom(Socket),
+    AddPlayerToRoom(Socket, u16),
+    SendMsgToSocket(Socket, MSG),
+}
+
+pub struct Server {
+    pub rooms: Vec<Room>,
+    pub addr: Option<Addr<Server>>,
+}
+
+impl Server {
+    fn find_room(&mut self, key: u16) -> Option<&mut Room> {
+        for room in self.rooms.iter_mut() {
+            if room.id == key {
+                return Some(room);
+            }
+        }
+        return None;
+    }
+}
+
+impl Handler<ServerCommands> for Server {
+    type Result = ();
+    fn handle(&mut self, msg: ServerCommands, _ctx: &mut Self::Context) -> Self::Result {
+        match msg {
+            ServerCommands::AddRoom(p1_socket) => {
+                let mut rng = rand::thread_rng();
+                let mut room_code = rng.gen::<u16>();
+                while let Some(_room) = self.find_room(room_code) {
+                    room_code = rng.gen::<u16>();
+                }
+                let room = Room::init(room_code, p1_socket, None);
+                self.rooms.push(room);
+            }
+            ServerCommands::AddPlayerToRoom(p2_socket, room_id) => {
+                let room = &mut self.find_room(room_id);
+                if let Some(room) = room {
+                    room.add_player(p2_socket);
+                }
+            }
+            ServerCommands::SendMsgToSocket(sckt, msg) => {
+                let socket = sckt.addr.unwrap();
+                socket.do_send(msg);
+            }
+        }
+    }
+}
+
+impl Actor for Server {
+    type Context = actix::Context<Self>;
+    fn started(&mut self, ctx: &mut Self::Context) {
+        println!("Server Started");
+        self.addr = Some(ctx.address());
+    }
+    // fn start(self) -> Addr<Self>
+    // where
+    //     Self: Actor<Context = actix::Context<Self>>,
+    // {
+    // }
+}
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -48,7 +117,7 @@ fn find_room_from_key<'a>(key: u16, rooms: &'a mut Vec<Room>) -> Option<&'a mut 
     // let rooms = ROOMS.lock().unwrap().as_slice();
     for room in rooms.iter_mut() {
         if room.id == key {
-            println!("{:p}",room);
+            println!("{:p}", room);
             return Some(room);
         }
     }
@@ -100,6 +169,7 @@ impl Room {
 pub struct Socket {
     pub id: String,
     pub addr: Option<Addr<Socket>>, // pub server: Addr<Server>,
+    pub server: Addr<Server>,
 }
 impl Handler<MSG> for Socket {
     type Result = ();
@@ -123,7 +193,8 @@ impl Clone for Socket {
     fn clone(&self) -> Self {
         Socket {
             id: self.id.clone(),
-            addr: self.addr.clone(), // server : self.server.clone()
+            addr: self.addr.clone(),
+            server: self.server.clone(),
         }
     }
 }

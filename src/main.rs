@@ -1,26 +1,42 @@
+use std::sync::Mutex;
+
+use actix::{Actor, Addr};
 use actix_cors::Cors;
 use actix_web::{get, http, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_actors::ws;
-
 mod socket;
+use once_cell::sync::Lazy;
 use socket::Socket;
+
+use crate::socket::Server;
 
 #[get("/")]
 async fn test() -> impl Responder {
     HttpResponse::Ok().body("Hello")
 }
 
+static SERVER: Mutex<Lazy<Addr<Server>>> = Mutex::new(Lazy::new(
+    (Server {
+        addr: None,
+        rooms: Vec::new(),
+    })
+    .start(),
+));
+
 #[get("/ws")]
 async fn get_ws(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, actix_web::Error> {
+    // let
+
     let resp = ws::start(
         Socket {
             id: String::from("0"),
             addr: None,
+            server: SERVER.lock().unwrap().to_owned(),
         },
         &req,
         stream,
     );
-    println!("{:?}", resp);
+    // println!("{:?}", resp);
     resp
 }
 
