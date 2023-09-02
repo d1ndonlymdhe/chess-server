@@ -15,13 +15,15 @@ async fn test() -> impl Responder {
     HttpResponse::Ok().body("Hello")
 }
 
-static SERVER: Mutex<Lazy<Addr<Server>>> = Mutex::new(Lazy::new(
-    (Server {
-        addr: None,
-        rooms: Vec::new(),
-    })
-    .start(),
-));
+static SERVER: Lazy<Mutex<Addr<Server>>> = Lazy::new(|| {
+    Mutex::new(
+        (Server {
+            addr: None,
+            rooms: Vec::new(),
+        })
+        .start(),
+    )
+});
 
 #[get("/ws")]
 async fn get_ws(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, actix_web::Error> {

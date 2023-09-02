@@ -1,4 +1,6 @@
-use actix::{dev::MessageResponse, Actor, Addr, AsyncContext, Handler, Message, StreamHandler};
+use actix::{
+    dev::MessageResponse, Actor, Addr, AsyncContext, Handler, MailboxError, Message, StreamHandler,
+};
 use actix_web_actors::ws;
 use once_cell::sync::Lazy;
 use rand::{self, Rng};
@@ -6,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::{collections::HashMap, sync::Mutex};
 // use std::vec;
+use futures::executor::block_on;
 use uuid::Uuid;
 
 // let mut rooms = vec
@@ -20,13 +23,30 @@ static ROOMS: Lazy<Mutex<Vec<Room>>> = Lazy::new(|| {
 });
 
 #[derive(Message)]
-#[rtype(result = "()")]
+#[rtype(result = "ServerRes")]
 
 enum ServerCommands {
     AddRoom(Socket),
     AddPlayerToRoom(Socket, u16),
     SendMsgToSocket(Socket, MSG),
 }
+#[derive(Message)]
+#[rtype(result = "()")]
+#[derive(MessageResponse)]
+enum ServerRes {
+    AddRoom(u16),
+    AddPlayerToRoom(Option<String>),
+    SendMsgToSocket(bool),
+}
+
+// impl MessageResponse<Server, ServerRes> for ServerRes {
+//     fn handle(
+//         self,
+//         ctx: &mut <Server as Actor>::Context,
+//         tx: Option<actix::dev::OneshotSender<<ServerRes as Message>::Result>>,
+//     ) {
+//     }
+// }
 
 pub struct Server {
     pub rooms: Vec<Room>,
@@ -45,27 +65,42 @@ impl Server {
 }
 
 impl Handler<ServerCommands> for Server {
-    type Result = ();
+    type Result = ServerRes;
     fn handle(&mut self, msg: ServerCommands, _ctx: &mut Self::Context) -> Self::Result {
         match msg {
             ServerCommands::AddRoom(p1_socket) => {
                 let mut rng = rand::thread_rng();
                 let mut room_code = rng.gen::<u16>();
+                println!("Here1");
+
                 while let Some(_room) = self.find_room(room_code) {
+                    println!("Here2");
                     room_code = rng.gen::<u16>();
                 }
                 let room = Room::init(room_code, p1_socket, None);
                 self.rooms.push(room);
+                println!("roomcode = {}", room_code);
+                return ServerRes::AddRoom(room_code);
             }
             ServerCommands::AddPlayerToRoom(p2_socket, room_id) => {
                 let room = &mut self.find_room(room_id);
                 if let Some(room) = room {
-                    room.add_player(p2_socket);
+                    if let Some(_) = room.sockets.1 {
+                        return ServerRes::AddPlayerToRoom(None);
+                    } else {
+                        room.add_player(p2_socket.clone());
+                        let msg = MSG::init(Event::ConnectWith, &p2_socket.id);
+                        room.sockets.clone().0.addr.unwrap().do_send(msg);
+                        return ServerRes::AddPlayerToRoom(Some(String::from(&room.sockets.0.id)));
+                    }
+                } else {
+                    return ServerRes::AddPlayerToRoom(None);
                 }
             }
             ServerCommands::SendMsgToSocket(sckt, msg) => {
                 let socket = sckt.addr.unwrap();
                 socket.do_send(msg);
+                return ServerRes::SendMsgToSocket(true);
             }
         }
     }
@@ -77,11 +112,6 @@ impl Actor for Server {
         println!("Server Started");
         self.addr = Some(ctx.address());
     }
-    // fn start(self) -> Addr<Self>
-    // where
-    //     Self: Actor<Context = actix::Context<Self>>,
-    // {
-    // }
 }
 
 #[derive(Message)]
@@ -297,39 +327,48 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
                                         let room_code = msg.parse::<u16>();
                                         match room_code {
                                             Ok(code) => {
-                                                let rooms = &mut ROOMS.lock().unwrap().to_vec();
-                                                let room = find_room_from_key(code, rooms);
-                                                if let Some(room) = room {
-                                                    if let Some(_) = room.sockets.1 {
+                                                async fn temp(
+                                                    sckt: Socket,
+                                                    code: u16,
+                                                ) -> Result<ServerRes, MailboxError>
+                                                {
+                                                    return sckt
+                                                        .server
+                                                        .send(ServerCommands::AddPlayerToRoom(
+                                                            sckt.clone(),
+                                                            code,
+                                                        ))
+                                                        .await;
+                                                }
+                                                let res =
+                                                    block_on(temp(self.clone(), code)).unwrap();
+                                                if let ServerRes::AddPlayerToRoom(pl1_id) = res {
+                                                    if let Some(pl1_id) = pl1_id {
                                                         let msg = create_ws_msg(
-                                                            EventOrError::EventError(
-                                                                EventError::RoomFull,
-                                                            ),
-                                                            &"The room is full",
+                                                            EventOrError::Event(Event::ConnectWith),
+                                                            &pl1_id,
                                                         )
                                                         .unwrap();
                                                         ctx.text(msg);
                                                     } else {
-                                                        room.add_player(self.clone());
-                                                        // room = Arc::clone(room.);
-                                                        // room = Arc::clone(room);
-                                                        room.sockets.1 = Some(self.clone());
-                                                        let pl1_msg =
-                                                            MSG::init(Event::ConnectWith, &self.id);
-                                                        println!("{}", code);
-                                                        let pl1_socket = room.sockets.0.clone();
                                                         let msg = create_ws_msg(
-                                                            EventOrError::Event(Event::ConnectWith),
-                                                            &pl1_socket.id,
+                                                            EventOrError::EventError(
+                                                                EventError::RoomFull,
+                                                            ),
+                                                            &"Couldn't add player",
                                                         )
                                                         .unwrap();
                                                         ctx.text(msg);
-                                                        room.clone()
-                                                            .get_pl1_addr()
-                                                            .do_send(pl1_msg);
-                                                        println!("{:p}", room);
-                                                        room.display();
                                                     }
+                                                } else {
+                                                    let msg = create_ws_msg(
+                                                        EventOrError::EventError(
+                                                            EventError::RoomFull,
+                                                        ),
+                                                        &"Couldn't add player",
+                                                    )
+                                                    .unwrap();
+                                                    ctx.text(msg);
                                                 }
                                             }
                                             Err(_) => {
@@ -345,27 +384,36 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
                                         }
                                     }
                                     Event::GetCode => {
-                                        let mut rng = rand::thread_rng();
-                                        let mut room_code = rng.gen::<u16>();
-                                        while let Some(_room) = find_room_from_key(
-                                            room_code,
-                                            &mut ROOMS.lock().unwrap().to_vec(),
-                                        ) {
-                                            room_code = rng.gen::<u16>();
+                                        async fn abcd(
+                                            sckt: Socket,
+                                        ) -> Result<ServerRes, MailboxError>
+                                        {
+                                            println!("Blocking");
+                                            return sckt
+                                                .server
+                                                .send(ServerCommands::AddRoom(sckt.clone()))
+                                                .await;
                                         }
-                                        let mut rooms = ROOMS.lock().unwrap();
-                                        let room = Room::init(room_code, self.clone(), None);
-                                        rooms.push(room);
-                                        // ROOMS.lock().unwrap().insert(room_code, room);
-                                        let res = create_ws_msg(
-                                            EventOrError::Event(event),
-                                            &HashMap::from([
-                                                ("id", &self.id),
-                                                ("code", &room_code.to_string()),
-                                            ]),
-                                        )
-                                        .unwrap();
-                                        ctx.text(res)
+                                        let x = block_on(abcd(self.clone())).unwrap();
+                                        if let ServerRes::AddRoom(room_code) = x {
+                                            println!("Here");
+                                            let res = create_ws_msg(
+                                                EventOrError::Event(Event::GetCode),
+                                                &HashMap::from([
+                                                    ("id", &self.id),
+                                                    ("code", &room_code.to_string()),
+                                                ]),
+                                            )
+                                            .unwrap();
+                                            ctx.text(res);
+                                        } else {
+                                            let res = create_ws_msg(
+                                                EventOrError::EventError(EventError::ParseError),
+                                                &"Internal Error",
+                                            )
+                                            .unwrap();
+                                            ctx.text(res);
+                                        }
                                     }
                                     Event::OppReady => {
                                         println!("{}", msg);
