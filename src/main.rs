@@ -45,7 +45,7 @@ async fn get_ws(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, 
 #[actix_web::main]
 async fn main() -> Result<(), std::io::Error> {
     // let server = server::ChessServer::new().start();
-    let server_addr = "127.0.0.1";
+    let server_addr = "0.0.0.0";
     let server_port = 8080;
     let app = HttpServer::new(move || {
         let cors = Cors::default()
