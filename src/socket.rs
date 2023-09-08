@@ -1,52 +1,19 @@
-use actix::{
-    dev::MessageResponse, Actor, Addr, AsyncContext, Handler, MailboxError, Message, StreamHandler,
-};
+use actix::{dev::MessageResponse, Actor, Addr, AsyncContext, Handler, Message, StreamHandler};
 use actix_web_actors::ws;
-use once_cell::sync::Lazy;
 use rand::{self, Rng};
 use serde::{Deserialize, Serialize};
-use serde_json;
-use std::{collections::HashMap, sync::Mutex};
-// use std::vec;
-use futures::executor::block_on;
+use serde_json::{self, Value};
+use std::collections::HashMap;
 use uuid::Uuid;
-
-// let mut rooms = vec
-static SERVER: Server = Server {
-    rooms: Vec::new(),
-    addr: None,
-};
-
-static ROOMS: Lazy<Mutex<Vec<Room>>> = Lazy::new(|| {
-    let map: Vec<Room> = Vec::new();
-    return Mutex::new(map);
-});
-
 #[derive(Message)]
-#[rtype(result = "ServerRes")]
+#[rtype(result = "()")]
 
 enum ServerCommands {
     AddRoom(Socket),
     AddPlayerToRoom(Socket, u16),
-    SendMsgToSocket(Socket, MSG),
+    OppReady(Socket, u16),
+    Move(Addr<Socket>, String, u16, (u8, u8), (u8, u8)),
 }
-#[derive(Message)]
-#[rtype(result = "()")]
-#[derive(MessageResponse)]
-enum ServerRes {
-    AddRoom(u16),
-    AddPlayerToRoom(Option<String>),
-    SendMsgToSocket(bool),
-}
-
-// impl MessageResponse<Server, ServerRes> for ServerRes {
-//     fn handle(
-//         self,
-//         ctx: &mut <Server as Actor>::Context,
-//         tx: Option<actix::dev::OneshotSender<<ServerRes as Message>::Result>>,
-//     ) {
-//     }
-// }
 
 pub struct Server {
     pub rooms: Vec<Room>,
@@ -65,42 +32,137 @@ impl Server {
 }
 
 impl Handler<ServerCommands> for Server {
-    type Result = ServerRes;
+    type Result = ();
     fn handle(&mut self, msg: ServerCommands, _ctx: &mut Self::Context) -> Self::Result {
         match msg {
             ServerCommands::AddRoom(p1_socket) => {
                 let mut rng = rand::thread_rng();
                 let mut room_code = rng.gen::<u16>();
-                println!("Here1");
-
                 while let Some(_room) = self.find_room(room_code) {
-                    println!("Here2");
                     room_code = rng.gen::<u16>();
                 }
-                let room = Room::init(room_code, p1_socket, None);
+                let room = Room::init(room_code, p1_socket.clone(), None, p1_socket.clone().id);
                 self.rooms.push(room);
+                #[derive(Serialize)]
+                struct IdAndCode {
+                    id: String,
+                    code: String,
+                }
+                p1_socket.clone().addr.unwrap().do_send(MSG::init(
+                    EventOrError::Event(Event::GetCode),
+                    &serde_json::to_string(&IdAndCode {
+                        id: p1_socket.id,
+                        code: room_code.to_string(),
+                    })
+                    .unwrap(),
+                ));
                 println!("roomcode = {}", room_code);
-                return ServerRes::AddRoom(room_code);
             }
             ServerCommands::AddPlayerToRoom(p2_socket, room_id) => {
                 let room = &mut self.find_room(room_id);
                 if let Some(room) = room {
+                    println!("Here room");
+                    room.display();
                     if let Some(_) = room.sockets.1 {
-                        return ServerRes::AddPlayerToRoom(None);
+                        p2_socket.clone().addr.unwrap().do_send(MSG::init(
+                            EventOrError::EventError(EventError::RoomFull),
+                            &String::from("Room Full"),
+                        ));
                     } else {
                         room.add_player(p2_socket.clone());
-                        let msg = MSG::init(Event::ConnectWith, &p2_socket.id);
+                        let msg = MSG::init(EventOrError::Event(Event::ConnectWith), &p2_socket.id);
                         room.sockets.clone().0.addr.unwrap().do_send(msg);
-                        return ServerRes::AddPlayerToRoom(Some(String::from(&room.sockets.0.id)));
+                        p2_socket.addr.unwrap().do_send(MSG::init(
+                            EventOrError::Event(Event::ConnectWith),
+                            &room.sockets.clone().0.id,
+                        ));
                     }
                 } else {
-                    return ServerRes::AddPlayerToRoom(None);
+                    let msg = MSG::init(
+                        EventOrError::EventError(EventError::RoomFull),
+                        &String::from("No room found"),
+                    );
+                    p2_socket.addr.unwrap().do_send(msg);
                 }
             }
-            ServerCommands::SendMsgToSocket(sckt, msg) => {
-                let socket = sckt.addr.unwrap();
-                socket.do_send(msg);
-                return ServerRes::SendMsgToSocket(true);
+            ServerCommands::OppReady(sckt, code) => {
+                let room = &mut self.find_room(code);
+                if let Some(room) = room {
+                    if let Some(pl2_socket) = room.sockets.1.clone() {
+                        if sckt.id == pl2_socket.id {
+                            room.get_pl1_addr()
+                                .do_send(MSG::init(EventOrError::Event(Event::OppReady), &sckt.id));
+                        } else {
+                            room.get_pl2_addr().do_send(MSG::init(
+                                EventOrError::Event(Event::OppReady),
+                                &room.sockets.0.id,
+                            ));
+                        }
+                    } else {
+                        let msg = MSG::init(
+                            EventOrError::EventError(EventError::RoomFull),
+                            &String::from("Room is full"),
+                        );
+                        sckt.addr.unwrap().do_send(msg);
+                    }
+                } else {
+                    let msg = MSG::init(
+                        EventOrError::EventError(EventError::RoomFull),
+                        &String::from("No room found"),
+                    );
+                    sckt.addr.unwrap().do_send(msg);
+                }
+            }
+            ServerCommands::Move(addr, socket_id, code, (i, j), (k, l)) => {
+                if i < 8 && j < 8 && k < 8 && l < 8 && (i != k || j != l) {
+                    let room = &mut self.find_room(code);
+                    if let Some(room) = room {
+                        if let Some(_) = room.get_addr_from_id(socket_id.clone()) {
+                            println!("{} {}", socket_id, room.turn);
+                            if socket_id == room.turn {
+                                if let Some(sib_sckt) = room.get_sibling_sckt(socket_id) {
+                                    room.turn = String::from(&sib_sckt.id);
+                                    let msg = MSG::init(
+                                        EventOrError::Event(Event::Move),
+                                        &serde_json::to_string(&HashMap::from([
+                                            ("i", i),
+                                            ("j", j),
+                                            ("k", k),
+                                            ("l", l),
+                                        ]))
+                                        .unwrap(),
+                                    );
+                                    sib_sckt.addr.unwrap().do_send(msg);
+                                } else {
+                                }
+                            } else {
+                                let msg = MSG::init(
+                                    EventOrError::EventError(EventError::RoomFull),
+                                    &String::from("Not your turn"),
+                                );
+                                addr.do_send(msg);
+                            }
+                        } else {
+                            let msg = MSG::init(
+                                EventOrError::EventError(EventError::RoomFull),
+                                &String::from("You Are not in room"),
+                            );
+                            addr.do_send(msg);
+                        }
+                    } else {
+                        let msg = MSG::init(
+                            EventOrError::EventError(EventError::RoomFull),
+                            &String::from("No room found"),
+                        );
+                        addr.do_send(msg)
+                    }
+                } else {
+                    let msg = MSG::init(
+                        EventOrError::EventError(EventError::RoomFull),
+                        &String::from("Invalid Move"),
+                    );
+                    addr.do_send(msg)
+                }
             }
         }
     }
@@ -117,12 +179,12 @@ impl Actor for Server {
 #[derive(Message)]
 #[rtype(result = "()")]
 struct MSG {
-    event: Event,
+    event: EventOrError,
     message: String,
 }
 
 impl MSG {
-    fn init(event: Event, message: &String) -> Self {
+    fn init(event: EventOrError, message: &String) -> Self {
         return MSG {
             event,
             message: String::from(message),
@@ -130,49 +192,23 @@ impl MSG {
     }
 }
 
-#[derive(Message)]
+#[derive(Message, Clone)]
 #[rtype(result = "Socket")]
 struct GetSocket {}
 
-impl Clone for MSG {
-    fn clone(&self) -> Self {
-        return MSG {
-            event: self.event.clone(),
-            message: self.message.clone(),
-        };
-    }
-}
-
-fn find_room_from_key<'a>(key: u16, rooms: &'a mut Vec<Room>) -> Option<&'a mut Room> {
-    // let rooms = ROOMS.lock().unwrap().as_slice();
-    for room in rooms.iter_mut() {
-        if room.id == key {
-            println!("{:p}", room);
-            return Some(room);
-        }
-    }
-    return None;
-}
-
+#[derive(Clone)]
 pub struct Room {
     pub id: u16,
+    pub turn: String,
     pub sockets: (Socket, Option<Socket>),
 }
 
-impl Clone for Room {
-    fn clone(&self) -> Self {
-        return Room {
-            id: self.id.clone(),
-            sockets: self.sockets.clone(),
-        };
-    }
-}
-
 impl Room {
-    fn init(id: u16, p1_socket: Socket, p2_socket: Option<Socket>) -> Room {
+    fn init(id: u16, p1_socket: Socket, p2_socket: Option<Socket>, turn: String) -> Room {
         return Room {
             id,
             sockets: (p1_socket.clone(), p2_socket.clone()),
+            turn,
         };
     }
     fn add_player(&mut self, pl_socket: Socket) {
@@ -183,6 +219,30 @@ impl Room {
     }
     fn get_pl2_addr(&mut self) -> Addr<Socket> {
         return self.sockets.1.clone().unwrap().addr.unwrap();
+    }
+    fn get_addr_from_id(&mut self, sckt_id: String) -> Option<Addr<Socket>> {
+        if sckt_id == self.sockets.0.id {
+            return Some(self.sockets.clone().0.addr.unwrap());
+        } else {
+            if let Some(pl2) = self.sockets.1.clone() {
+                if sckt_id == pl2.id {
+                    return Some(pl2.addr.unwrap());
+                }
+            }
+        }
+        return None;
+    }
+    fn get_sibling_sckt(&mut self, sckt_id: String) -> Option<Socket> {
+        if sckt_id == self.sockets.0.id {
+            return self.sockets.1.clone();
+        } else {
+            if let Some(pl2) = self.sockets.1.clone() {
+                if sckt_id == pl2.id {
+                    return Some(self.sockets.0.clone());
+                }
+            }
+        }
+        return None;
     }
     fn display(&self) {
         let p1id = self.sockets.0.clone().id;
@@ -195,7 +255,7 @@ impl Room {
     }
 }
 
-#[derive(MessageResponse)]
+#[derive(MessageResponse, Clone)]
 pub struct Socket {
     pub id: String,
     pub addr: Option<Addr<Socket>>, // pub server: Addr<Server>,
@@ -204,11 +264,21 @@ pub struct Socket {
 impl Handler<MSG> for Socket {
     type Result = ();
     fn handle(&mut self, msg: MSG, ctx: &mut Self::Context) -> Self::Result {
-        let event = msg.event;
+        let event: String = match msg.event {
+            EventOrError::Event(e) => e.to_string(),
+            EventOrError::EventError(e) => e.to_string(),
+        };
         let msg = msg.message;
-        let res = create_ws_msg(EventOrError::Event(event), &msg).unwrap();
-        println!("{}", res);
-        ctx.text(res);
+        let x: Result<Value, serde_json::Error> = serde_json::from_str(&msg.clone());
+        if let Ok(y) = x {
+            let res = serde_json::to_string(&WsMsg { event, msg: y }).unwrap();
+            println!("{}", res);
+            ctx.text(res);
+        } else {
+            let res = serde_json::to_string(&WsMsg { event, msg }).unwrap();
+            println!("{}", res);
+            ctx.text(res);
+        }
     }
 }
 
@@ -219,27 +289,19 @@ impl Handler<GetSocket> for Socket {
     }
 }
 
-impl Clone for Socket {
-    fn clone(&self) -> Self {
-        Socket {
-            id: self.id.clone(),
-            addr: self.addr.clone(),
-            server: self.server.clone(),
-        }
-    }
-}
-
 impl Actor for Socket {
     type Context = ws::WebsocketContext<Self>;
     fn started(&mut self, ctx: &mut Self::Context) {
         self.id = Uuid::new_v4().to_string();
         self.addr = Some(ctx.address());
+        let text = create_ws_msg(EventOrError::Event(Event::Start), &self.id).unwrap();
+        ctx.text(text);
         println!("Start");
     }
 
     // fn
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum Event {
     Move,
     GameOver,
@@ -248,23 +310,11 @@ enum Event {
     ConnectWith,
     OppReady,
 }
+#[derive(Clone, Serialize, Deserialize)]
 enum EventError {
     ParseError,
     InvalidCode,
     RoomFull,
-}
-
-impl Clone for Event {
-    fn clone(&self) -> Self {
-        match self {
-            Event::Start => Event::Start,
-            Event::GameOver => Event::GameOver,
-            Event::GetCode => Event::GetCode,
-            Event::ConnectWith => Event::ConnectWith,
-            Event::Move => Event::Move,
-            Event::OppReady => Event::OppReady,
-        }
-    }
 }
 
 impl EventError {
@@ -301,10 +351,19 @@ impl Event {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct WsMsg<E, M> {
     event: E,
     msg: M,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct MoveMsg {
+    room_code: String,
+    i: u8,
+    j: u8,
+    k: u8,
+    l: u8,
 }
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
@@ -313,155 +372,84 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
             Ok(message) => match message {
                 ws::Message::Text(text) => {
                     let text_string = text.to_string();
+                    println!("{}", text_string);
                     let msg_struct = serde_json::from_str::<WsMsg<String, String>>(&text_string);
+
                     match msg_struct {
                         Ok(socket_msg) => {
                             let event = socket_msg.event;
                             let msg = socket_msg.msg;
                             match Event::from_string(&event) {
                                 Ok(event) => match event {
-                                    Event::Move => ctx.text("moving"),
-                                    Event::GameOver => ctx.text("gameover"),
-                                    Event::Start => ctx.text("starting"),
-                                    Event::ConnectWith => {
-                                        let room_code = msg.parse::<u16>();
-                                        match room_code {
-                                            Ok(code) => {
-                                                async fn temp(
-                                                    sckt: Socket,
-                                                    code: u16,
-                                                ) -> Result<ServerRes, MailboxError>
-                                                {
-                                                    return sckt
-                                                        .server
-                                                        .send(ServerCommands::AddPlayerToRoom(
-                                                            sckt.clone(),
-                                                            code,
-                                                        ))
-                                                        .await;
-                                                }
-                                                let res =
-                                                    block_on(temp(self.clone(), code)).unwrap();
-                                                if let ServerRes::AddPlayerToRoom(pl1_id) = res {
-                                                    if let Some(pl1_id) = pl1_id {
-                                                        let msg = create_ws_msg(
-                                                            EventOrError::Event(Event::ConnectWith),
-                                                            &pl1_id,
-                                                        )
-                                                        .unwrap();
-                                                        ctx.text(msg);
-                                                    } else {
-                                                        let msg = create_ws_msg(
-                                                            EventOrError::EventError(
-                                                                EventError::RoomFull,
-                                                            ),
-                                                            &"Couldn't add player",
-                                                        )
-                                                        .unwrap();
-                                                        ctx.text(msg);
-                                                    }
-                                                } else {
-                                                    let msg = create_ws_msg(
-                                                        EventOrError::EventError(
-                                                            EventError::RoomFull,
-                                                        ),
-                                                        &"Couldn't add player",
-                                                    )
-                                                    .unwrap();
-                                                    ctx.text(msg);
-                                                }
-                                            }
-                                            Err(_) => {
+                                    Event::Move => {
+                                        let msg_struct =
+                                            serde_json::from_str::<WsMsg<String, String>>(
+                                                &text_string,
+                                            );
+                                        let mv = serde_json::from_str::<MoveMsg>(
+                                            &msg_struct.unwrap().msg,
+                                        );
+                                        if let Ok(mv) = mv {
+                                            let room_code = mv.room_code.parse::<u16>();
+                                            if let Ok(room_code) = room_code {
+                                                self.server.do_send(ServerCommands::Move(
+                                                    self.addr.clone().unwrap(),
+                                                    self.clone().id,
+                                                    room_code,
+                                                    (mv.i, mv.j),
+                                                    (mv.k, mv.l),
+                                                ))
+                                            } else {
                                                 let msg = create_ws_msg(
                                                     EventOrError::EventError(
-                                                        EventError::InvalidCode,
+                                                        EventError::ParseError,
                                                     ),
                                                     &"Invalid room code",
                                                 )
                                                 .unwrap();
                                                 ctx.text(msg);
                                             }
+                                        } else {
+                                            let msg = create_ws_msg(
+                                                EventOrError::EventError(EventError::ParseError),
+                                                &"Invalid json",
+                                            )
+                                            .unwrap();
+                                            ctx.text(msg);
+                                        }
+                                    }
+                                    Event::GameOver => ctx.text("gameover"),
+                                    Event::Start => ctx.text("starting"),
+                                    Event::ConnectWith => {
+                                        let room_code = msg.trim().parse::<u16>();
+
+                                        if let Ok(code) = room_code {
+                                            println!("passed code = {}", code);
+                                            self.server.do_send(ServerCommands::AddPlayerToRoom(
+                                                self.clone(),
+                                                code,
+                                            ));
+                                        } else {
+                                            let msg = create_ws_msg(
+                                                EventOrError::EventError(EventError::InvalidCode),
+                                                &"Invalid room code",
+                                            )
+                                            .unwrap();
+                                            ctx.text(msg);
                                         }
                                     }
                                     Event::GetCode => {
-                                        async fn abcd(
-                                            sckt: Socket,
-                                        ) -> Result<ServerRes, MailboxError>
-                                        {
-                                            println!("Blocking");
-                                            return sckt
-                                                .server
-                                                .send(ServerCommands::AddRoom(sckt.clone()))
-                                                .await;
-                                        }
-                                        let x = block_on(abcd(self.clone())).unwrap();
-                                        if let ServerRes::AddRoom(room_code) = x {
-                                            println!("Here");
-                                            let res = create_ws_msg(
-                                                EventOrError::Event(Event::GetCode),
-                                                &HashMap::from([
-                                                    ("id", &self.id),
-                                                    ("code", &room_code.to_string()),
-                                                ]),
-                                            )
-                                            .unwrap();
-                                            ctx.text(res);
-                                        } else {
-                                            let res = create_ws_msg(
-                                                EventOrError::EventError(EventError::ParseError),
-                                                &"Internal Error",
-                                            )
-                                            .unwrap();
-                                            ctx.text(res);
-                                        }
+                                        self.server.do_send(ServerCommands::AddRoom(self.clone()));
                                     }
                                     Event::OppReady => {
                                         println!("{}", msg);
                                         let code = msg.trim().parse::<u16>();
                                         println!("Opp Ready");
                                         if let Ok(code) = code {
-                                            let rooms = &mut ROOMS.lock().unwrap().to_vec();
-                                            let room = find_room_from_key(code, rooms);
-                                            if let Some(room) = room {
-                                                println!("{:p}", room);
-                                                room.display();
-                                                if let Some(pl2_socket) = room.sockets.1.clone() {
-                                                    if self.id == pl2_socket.id {
-                                                        room.clone().get_pl1_addr().clone().do_send(
-                                                            MSG::init(
-                                                                Event::OppReady,
-                                                                &pl2_socket.id,
-                                                            ),
-                                                        )
-                                                    } else {
-                                                        room.clone().get_pl2_addr().clone().do_send(
-                                                            MSG::init(
-                                                                Event::OppReady,
-                                                                &room.sockets.0.id,
-                                                            ),
-                                                        )
-                                                    }
-                                                } else {
-                                                    let text = create_ws_msg(
-                                                        EventOrError::EventError(
-                                                            EventError::RoomFull,
-                                                        ),
-                                                        &"Player 2 not joined",
-                                                    )
-                                                    .unwrap();
-                                                    ctx.text(text)
-                                                }
-                                                // room.sockets.0.id;
-                                            } else {
-                                                let msg = create_ws_msg(
-                                                    EventOrError::EventError(
-                                                        EventError::ParseError,
-                                                    ),
-                                                    &"Invalid Room Code",
-                                                )
-                                                .unwrap();
-                                                ctx.text(msg);
-                                            }
+                                            self.server.do_send(ServerCommands::OppReady(
+                                                self.clone(),
+                                                code,
+                                            ));
                                         } else {
                                             let msg = create_ws_msg(
                                                 EventOrError::EventError(EventError::ParseError),
@@ -485,10 +473,10 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
                                 },
                             }
                         }
-                        Err(_err) => {
+                        Err(err) => {
                             let res = create_ws_msg(
                                 EventOrError::EventError(EventError::ParseError),
-                                &"Error parsing json",
+                                &err.to_string(),
                             )
                             .unwrap();
                             ctx.text(res);
@@ -506,6 +494,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 enum EventOrError {
     Event(Event),
     EventError(EventError),
