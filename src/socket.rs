@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
+
 #[derive(Message)]
 #[rtype(result = "()")]
 
@@ -13,6 +14,7 @@ enum ServerCommands {
     AddPlayerToRoom(Socket, u16),
     OppReady(Socket, u16),
     Move(Addr<Socket>, String, u16, (u8, u8), (u8, u8)),
+    Promote(u16, String, (u8, u8), String),
 }
 
 pub struct Server {
@@ -70,11 +72,12 @@ impl Handler<ServerCommands> for Server {
                         ));
                     } else {
                         room.add_player(p2_socket.clone());
-                        let msg = MSG::init(EventOrError::Event(Event::ConnectWith), &p2_socket.id);
+                        let msg =
+                            MSG::init(EventOrError::Event(Event::ConnectWith), &p2_socket.name);
                         room.sockets.clone().0.addr.unwrap().do_send(msg);
                         p2_socket.addr.unwrap().do_send(MSG::init(
                             EventOrError::Event(Event::ConnectWith),
-                            &room.sockets.clone().0.id,
+                            &room.sockets.clone().0.name,
                         ));
                     }
                 } else {
@@ -110,6 +113,7 @@ impl Handler<ServerCommands> for Server {
                         EventOrError::EventError(EventError::RoomFull),
                         &String::from("No room found"),
                     );
+                    // let e = MSG::init(
                     sckt.addr.unwrap().do_send(msg);
                 }
             }
@@ -162,6 +166,30 @@ impl Handler<ServerCommands> for Server {
                         &String::from("Invalid Move"),
                     );
                     addr.do_send(msg)
+                }
+            }
+
+            ServerCommands::Promote(room_code, sckt_id, (i, j), value) => {
+                let room = &mut self.find_room(room_code);
+                if let Some(room) = room {
+                    if room.turn == sckt_id {
+                        let sib_sckt = room.get_sibling_sckt(sckt_id).unwrap();
+                        room.turn = sib_sckt.id;
+                        sib_sckt.addr.unwrap().do_send(MSG::init(
+                            EventOrError::Event(Event::Promote),
+                            &serde_json::to_string(&HashMap::from([
+                                ("i", i.to_string()),
+                                ("j", j.to_string()),
+                                ("value", value),
+                            ]))
+                            .unwrap(),
+                        ));
+                    } else {
+                        room.get_addr_from_id(sckt_id).unwrap().do_send(MSG {
+                            event: EventOrError::EventError(EventError::RoomFull),
+                            message: String::from("Not your turn"),
+                        })
+                    }
                 }
             }
         }
@@ -258,9 +286,17 @@ impl Room {
 #[derive(MessageResponse, Clone)]
 pub struct Socket {
     pub id: String,
+    pub name: String,
     pub addr: Option<Addr<Socket>>, // pub server: Addr<Server>,
     pub server: Addr<Server>,
 }
+
+impl Socket {
+    fn set_name(&mut self, name: String) {
+        self.name = String::from(&name);
+    }
+}
+
 impl Handler<MSG> for Socket {
     type Result = ();
     fn handle(&mut self, msg: MSG, ctx: &mut Self::Context) -> Self::Result {
@@ -309,6 +345,8 @@ enum Event {
     GetCode,
     ConnectWith,
     OppReady,
+    Promote,
+    PromoteReq,
 }
 #[derive(Clone, Serialize, Deserialize)]
 enum EventError {
@@ -336,6 +374,8 @@ impl Event {
             Event::ConnectWith => return String::from("ConnectWith"),
             Event::GetCode => return String::from("GetCode"),
             Event::OppReady => return String::from("OppReady"),
+            Event::Promote => return String::from("Promote"),
+            Event::PromoteReq => return String::from("PromoteReq"),
         }
     }
     fn from_string(string: &str) -> Result<Event, EventError> {
@@ -346,6 +386,8 @@ impl Event {
             "ConnectWith" => return Ok(Event::ConnectWith),
             "GetCode" => return Ok(Event::GetCode),
             "OppReady" => return Ok(Event::OppReady),
+            "Promote" => return Ok(Event::Promote),
+            "PromoteReq" => return Ok(Event::PromoteReq),
             _ => return Err(EventError::ParseError),
         }
     }
@@ -421,24 +463,41 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
                                     Event::GameOver => ctx.text("gameover"),
                                     Event::Start => ctx.text("starting"),
                                     Event::ConnectWith => {
-                                        let room_code = msg.trim().parse::<u16>();
+                                        #[derive(Serialize, Deserialize)]
+                                        struct ConnectWithMsg {
+                                            room_code: String,
+                                            name: String,
+                                        }
 
-                                        if let Ok(code) = room_code {
-                                            println!("passed code = {}", code);
-                                            self.server.do_send(ServerCommands::AddPlayerToRoom(
-                                                self.clone(),
-                                                code,
-                                            ));
-                                        } else {
-                                            let msg = create_ws_msg(
-                                                EventOrError::EventError(EventError::InvalidCode),
-                                                &"Invalid room code",
-                                            )
-                                            .unwrap();
-                                            ctx.text(msg);
+                                        let connect_msg =
+                                            serde_json::from_str::<ConnectWithMsg>(&msg);
+
+                                        if let Ok(connect_msg) = connect_msg {
+                                            let room_code =
+                                                connect_msg.room_code.trim().parse::<u16>();
+                                            if let Ok(code) = room_code {
+                                                println!("passed code = {}", code);
+                                                self.set_name(connect_msg.name);
+                                                self.server.do_send(
+                                                    ServerCommands::AddPlayerToRoom(
+                                                        self.clone(),
+                                                        code,
+                                                    ),
+                                                );
+                                            } else {
+                                                let msg = create_ws_msg(
+                                                    EventOrError::EventError(
+                                                        EventError::InvalidCode,
+                                                    ),
+                                                    &"Invalid room code",
+                                                )
+                                                .unwrap();
+                                                ctx.text(msg);
+                                            }
                                         }
                                     }
                                     Event::GetCode => {
+                                        self.set_name(msg);
                                         self.server.do_send(ServerCommands::AddRoom(self.clone()));
                                     }
                                     Event::OppReady => {
@@ -458,6 +517,47 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for Socket {
                                             .unwrap();
                                             ctx.text(msg);
                                         }
+                                    }
+                                    Event::Promote => {
+                                        #[derive(Deserialize)]
+                                        struct PromoteMsg {
+                                            room_code: String,
+                                            i: u8,
+                                            j: u8,
+                                            promote_to: String,
+                                        }
+                                        let promote_msg = serde_json::from_str::<PromoteMsg>(&msg);
+                                        if let Ok(promote_msg) = promote_msg {
+                                            let PromoteMsg {
+                                                room_code,
+                                                i,
+                                                j,
+                                                promote_to,
+                                            } = promote_msg;
+                                            let mut valid_promote = false;
+                                            for k in ["H", "B", "Q", "R"] {
+                                                if k == promote_to {
+                                                    valid_promote = true;
+                                                }
+                                            }
+                                            // ["H", "B", "Q", "R"].iter().collect();
+                                            if let Ok(room_code) = room_code.parse::<u16>() {
+                                                if (i == 0 || i == 7) && j < 8 && valid_promote {
+                                                    self.server.do_send(ServerCommands::Promote(
+                                                        room_code,
+                                                        self.clone().id,
+                                                        (i, j),
+                                                        promote_to,
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Event::PromoteReq => {
+                                        // println!()
+                                        // struct PromoteReqReq {
+                                        //     room_code: String,
+                                        // }
                                     }
                                 },
                                 Err(event_error) => match event_error {
